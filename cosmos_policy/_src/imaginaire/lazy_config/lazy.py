@@ -66,8 +66,10 @@ def sort_recursive(obj: Union[Dict[str, Any], List[Any], Any]) -> Union[OrderedD
 
 yaml.add_representer(OrderedDict, dict_representer)
 
-OmegaConf.register_new_resolver("add", lambda *vals: sum(vals))
-OmegaConf.register_new_resolver("subtract", lambda *vals: vals[0] - sum(vals[1:]))
+OmegaConf.register_new_resolver("add", lambda *vals: sum(vals), replace=True)
+OmegaConf.register_new_resolver(
+    "subtract", lambda *vals: vals[0] - sum(vals[1:]), replace=True
+)
 
 
 def get_default_params(cls_or_func):
