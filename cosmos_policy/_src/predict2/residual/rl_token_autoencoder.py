@@ -304,6 +304,44 @@ class RLTokenAutoencoder(nn.Module):
             model_dim=model_dim,
         )
 
+        # Per-channel normalization of the input VAE latents. Initialized to
+        # identity (mean=0, std=1); set via ``set_latent_stats`` after a one-
+        # time sweep over the training cache. Persisted in ``state_dict`` so
+        # downstream RL inference uses the same scaling automatically.
+        self.register_buffer(
+            "latent_mean", torch.zeros(1, in_channels, 1, 1, 1)
+        )
+        self.register_buffer(
+            "latent_std", torch.ones(1, in_channels, 1, 1, 1)
+        )
+
+    def set_latent_stats(
+        self, mean: torch.Tensor, std: torch.Tensor
+    ) -> None:
+        """Inject per-channel ``mean`` / ``std`` into the input normalizer.
+
+        Both tensors must have shape ``(1, C, 1, 1, 1)``. Values are copied
+        into the existing buffers so device placement is preserved.
+        """
+        if mean.shape != self.latent_mean.shape:
+            raise ValueError(
+                f"mean shape {tuple(mean.shape)} != "
+                f"{tuple(self.latent_mean.shape)}"
+            )
+        if std.shape != self.latent_std.shape:
+            raise ValueError(
+                f"std shape {tuple(std.shape)} != "
+                f"{tuple(self.latent_std.shape)}"
+            )
+        self.latent_mean.copy_(mean.to(self.latent_mean))
+        self.latent_std.copy_(std.to(self.latent_std).clamp_min(1e-6))
+
+    def _normalize(self, vae_latent: torch.Tensor) -> torch.Tensor:
+        return (vae_latent - self.latent_mean) / self.latent_std
+
+    def _denormalize(self, vae_latent: torch.Tensor) -> torch.Tensor:
+        return vae_latent * self.latent_std + self.latent_mean
+
     def _grid_shape(self, vae_latent: torch.Tensor) -> tuple[int, int, int]:
         _, _, T, H, W = vae_latent.shape
         return (
@@ -313,22 +351,37 @@ class RLTokenAutoencoder(nn.Module):
         )
 
     def encode(self, vae_latent: torch.Tensor) -> torch.Tensor:
-        return self.encoder(self.patchify(vae_latent))
+        """Map a raw cosmos VAE latent to the single RL token.
+
+        Input is the raw latent as produced by ``Wan2pt1VAEInterface.encode``;
+        normalization is applied internally so callers don't need to
+        rescale. This makes the encoder a drop-in replacement for downstream
+        RL code: ``rl_token = ae.encode(cosmos_vae.encode(image))``.
+        """
+        return self.encoder(self.patchify(self._normalize(vae_latent)))
 
     def decode(
         self,
         rl_token: torch.Tensor,
         target_grid: tuple[int, int, int],
     ) -> torch.Tensor:
+        """Reconstruct a raw VAE latent from the RL token (denormalized)."""
         tokens = self.decoder(rl_token, target_grid)
-        return self.unpatchify(tokens)
+        return self._denormalize(self.unpatchify(tokens))
 
     def reconstruction_loss(self, vae_latent: torch.Tensor) -> torch.Tensor:
-        """L_ro = mean(|| AE(vae_latent) - sg(vae_latent) ||^2) in VAE latent space."""
-        z_rl = self.encode(vae_latent)
-        recon = self.decode(z_rl, target_grid=self._grid_shape(vae_latent))
-        target = vae_latent.detach()
-        return ((recon - target) ** 2).mean()
+        """L_ro = MSE in *normalized* latent space.
+
+        Computed on the normalized representation (rather than the raw VAE
+        scale) so the per-channel loss contributions are balanced and the
+        magnitude is interpretable as roughly ``1 - R^2``.
+        """
+        target_norm = self._normalize(vae_latent).detach()
+        z_rl = self.encoder(self.patchify(target_norm))
+        recon_norm = self.unpatchify(
+            self.decoder(z_rl, target_grid=self._grid_shape(vae_latent))
+        )
+        return ((recon_norm - target_norm) ** 2).mean()
 
     def forward(self, vae_latent: torch.Tensor) -> torch.Tensor:
         return self.encode(vae_latent)
