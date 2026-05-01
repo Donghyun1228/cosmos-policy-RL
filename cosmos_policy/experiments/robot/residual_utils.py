@@ -33,6 +33,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -162,6 +163,18 @@ def encode_image_to_rl_token(
     return rl_token_ae.encode(vae_latent[:, :, 1:2])
 
 
+def _stack_action_chunk(actions: Any) -> torch.Tensor:
+    """``cosmos_utils.get_action`` returns ``actions`` in a variable shape:
+    a flat ``List[np.ndarray]`` of length ``T`` for ``batch_size=1``, and
+    ``List[List[np.ndarray]]`` (outer ``B``, inner ``T``) for ``B>1``.
+    Stack into a uniform ``(B, T, 7)`` float tensor."""
+    if isinstance(actions[0], np.ndarray):
+        arr = np.stack(actions, axis=0)  # (T, 7)
+        return torch.from_numpy(arr).unsqueeze(0).float()  # (1, T, 7)
+    arr = np.stack([np.stack(a, axis=0) for a in actions], axis=0)  # (B, T, 7)
+    return torch.from_numpy(arr).float()
+
+
 def _extract_goal_vae_latent(cosmos_output: dict[str, Any]) -> torch.Tensor:
     """Slice the future-image VAE latent out of cosmos's denoised output.
 
@@ -202,12 +215,12 @@ def get_action_with_goal_state(
         cfg=cfg,
         model=cosmos_model,
         dataset_stats=dataset_stats,
-        observation=observation,
-        task_description=task_description,
+        obs=observation,
+        task_label_or_embedding=task_description,
         **get_action_kwargs,
     )
 
-    action_chunk: torch.Tensor = output["actions"]
+    action_chunk = _stack_action_chunk(output["actions"]).to(DEVICE)
     goal_vae_latent = _extract_goal_vae_latent(output)
     with torch.no_grad():
         goal_z_rl = rl_token_ae.encode(goal_vae_latent)
